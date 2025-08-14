@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68","wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packrat"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["filelock>=3.12"]  # simple cross-platform lock
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["packrat*"]
+
+[project.scripts]
+packrat = "packrat.cli:main"
