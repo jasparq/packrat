@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, io, tarfile, shutil, hashlib
 from pathlib import Path
+import re
 from datetime import datetime, timezone
 from packrat.config import Config
 from packrat.metadata import load_seed_metadata, make_final_metadata
@@ -14,6 +15,15 @@ class HashingReader:
     def close(self): 
         try: self._fp.close()
         except Exception: pass
+
+SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+def _sanitize(name:str) -> str:
+    return SAFE_NAME.sub("_", name).strip("._-") or "archive"
+
+def _bucket_from_meta(meta:dict) -> str:
+    t = str((meta or {}).get("type","")).strip().lower()
+    return "STUDY" if t == "study" else "NONSTUDY"
 
 def stream_into_tar_with_sha256(tar: tarfile.TarFile, src_abs: Path, arc_rel: str):
     st = src_abs.stat()
@@ -35,6 +45,16 @@ def archive_one_folder_single_pass(cfg: Config, entry_name: str, folder_abs: str
 
     final_tar = cfg.archive_dir / f"{entry_name}.tar.gz"
     temp_tar = final_tar.with_suffix(".tar.gz.part")
+
+    # shard: <archive_root>/<type>/<YYYY><safe_name>.tar.gz
+    bucket = _bucket_from_meta(seed)    # "study" or "nonstudy"
+    year = datetime.now(timezone.utc).strftime("%Y")
+    safe_name = _sanitize(entry_name)
+    out_dir = (cfg.archive_dir / bucket / year)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_tar = out_dir / f"{safe_name}.tar.gz"
+    temp_tar = final_tar.with_suffix(final_tar.suffix + ".part")
+
     manifest: list[dict] = []
 
     if cfg.dry_run:
