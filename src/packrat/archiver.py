@@ -2,9 +2,14 @@ from __future__ import annotations
 import os, io, tarfile, shutil, hashlib
 from pathlib import Path
 import re
+import logging
+logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from packrat.config import Config
 from packrat.metadata import load_seed_metadata, make_final_metadata
+
+from packrat.sharepoint.graph_client import GraphClient
+from packrat.sharepoint.archive_index import ArchiveIndex
 
 class HashingReader:
     def __init__(self, fp, hasher): self._fp, self._hasher = fp, hasher
@@ -80,7 +85,55 @@ def archive_one_folder_single_pass(cfg: Config, entry_name: str, folder_abs: str
         tf.addfile(ti, fileobj=io.BytesIO(meta_bytes))
 
     os.replace(temp_tar, final_tar)
+
+    # Calculate tar file hash
+    sha256_hash = hashlib.sha256()
+    with open(final_tar, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    tar_hash = sha256_hash.hexdigest()
+
+    # Index to SharePoint if enabled
+    sharepoint_status = ""
+    if cfg.sharepoint_enabled:
+        try:
+            graph_client = GraphClient(
+                tenant_id=cfg.sharepoint_tenant_id,
+                client_id=cfg.sharepoint_client_id,
+                client_secret=cfg.sharepoint_client_secret,
+            )
+            archive_index = ArchiveIndex(
+                graph_client=graph_client,
+                site_id=cfg.sharepoint_site_id,
+                list_id=cfg.sharepoint_list_id,
+            )
+            response = archive_index.index_archive(
+                archive_name=safe_name,
+                tar_path=str(final_tar),
+                manifest_count=len(manifest),
+                tar_hash=tar_hash,
+            )
+            item_id = response.get("id")
+
+            # Upload metadata attachment
+            if item_id:
+                metadata_file = folder /cfg.meta_name
+                if metadata_file.exists():
+                    try:
+                        archive_index.upload_attachment(item_id, str(metadata_file))
+                        sharepoint_status = " [indexed +metadata attached]"
+                    except Exception as e:
+                        logger.warning(f"Failed to upload metadata attachment: {e}")
+                        sharepoint_status = " [index, attachment failed]"
+                else:
+                    sharepoint_status = " [indexed]"
+
+        except Exception as e:
+            logging.error(f"Failed to index archive to SharePoint: {e}")
+
+    # Remove the original folder
     shutil.rmtree(folder)
+
     return f"OK     {entry_name}: -> {final_tar} ({len(manifest)} files)"
 
 def find_ready_folders(cfg: Config) -> list[tuple[str, str]]:

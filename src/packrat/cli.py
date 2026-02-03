@@ -1,9 +1,25 @@
-import argparse, logging, sys
+import argparse, logging, sys, os
 from filelock import FileLock, Timeout
 from pathlib import Path
 from packrat.config import Config
 from packrat.logging_setup import setup_logging
 from packrat.archiver import find_ready_folders, archive_one_folder_single_pass
+
+def load_env_file(env_path):
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key, value)
+    except Exception as e:
+        print(f"Warning: could not load env file {env_path}: {e}")
+
+env_path = os.environ.get("PACKRAT_ENV_FILE","/home/packrat/tests/.env.test")
+load_env_file(env_path)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
