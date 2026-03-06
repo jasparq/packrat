@@ -1,150 +1,78 @@
 from __future__ import annotations
-import os, io, tarfile, shutil, hashlib
-from pathlib import Path
+
+import hashlib
+import os
 import re
-import logging
-logger = logging.getLogger(__name__)
+import tarfile
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+from packrat.archive_jobs import PreparingJob
+
 from packrat.config import Config
-from packrat.metadata import load_seed_metadata, make_final_metadata
-
-from packrat.sharepoint.graph_client import GraphClient
-from packrat.sharepoint.archive_index import ArchiveIndex
-
-class HashingReader:
-    def __init__(self, fp, hasher): self._fp, self._hasher = fp, hasher
-    def read(self, size=-1):
-        chunk = self._fp.read(size)
-        if chunk: self._hasher.update(chunk)
-        return chunk
-    def close(self): 
-        try: self._fp.close()
-        except Exception: pass
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
-def _sanitize(name:str) -> str:
+
+def _sanitize(name: str) -> str:
     return SAFE_NAME.sub("_", name).strip("._-") or "archive"
 
-def _bucket_from_meta(meta:dict) -> str:
-    t = str((meta or {}).get("type","")).strip().lower()
-    return "STUDY" if t == "study" else "NONSTUDY"
 
-def stream_into_tar_with_sha256(tar: tarfile.TarFile, src_abs: Path, arc_rel: str):
-    st = src_abs.stat()
-    ti = tarfile.TarInfo(name=arc_rel)
-    ti.size = st.st_size
-    ti.mtime = int(st.st_mtime)
-    ti.mode = st.st_mode & 0o777
-    hasher = hashlib.sha256()
-    with open(src_abs, "rb", buffering=0) as f:
-        tar.addfile(ti, fileobj=HashingReader(f, hasher))
-    return st.st_size, hasher.hexdigest()
+def _bucket_from_archive_index(archive_index: str) -> str:
+    return "STUDY" if archive_index.startswith("S-") else "NONSTUDY"
 
-def archive_one_folder_single_pass(cfg: Config, entry_name: str, folder_abs: str | Path) -> str:
+
+def ensure_staging_folders(
+    cfg: Config,
+    jobs: Sequence[PreparingJob],
+) -> tuple[list[dict[str, str]], int]:
+    created: list[dict[str, str]] = []
+    skipped = 0
+
+    for job in jobs:
+        safe = _sanitize(str(job["archive_index"]))
+        folder = cfg.base_dir / safe
+
+        if folder.exists():
+            skipped += 1
+            continue
+
+        folder.mkdir(parents=True, exist_ok=False)
+        created.append({"id": job["id"], "path": str(folder)})
+
+    return created, skipped
+
+
+def archive_folder_dataverse(
+    cfg: Config,
+    entry_name: str,
+    folder_abs: str | Path,
+) -> tuple[Path, Path, str]:
     folder = Path(folder_abs)
-    meta_path = folder / cfg.meta_name
-    seed = load_seed_metadata(str(meta_path))
-    if seed.get("ready_to_archive") is not True:
-        return f"SKIP   {entry_name}: not ready_to_archive"
 
-    final_tar = cfg.archive_dir / f"{entry_name}.tar.gz"
-    temp_tar = final_tar.with_suffix(".tar.gz.part")
-
-    # shard: <archive_root>/<type>/<YYYY><safe_name>.tar.gz
-    bucket = _bucket_from_meta(seed)    # "study" or "nonstudy"
+    bucket = _bucket_from_archive_index(entry_name)
     year = datetime.now(timezone.utc).strftime("%Y")
     safe_name = _sanitize(entry_name)
-    out_dir = (cfg.archive_dir / bucket / year)
+    out_dir = cfg.archive_dir / bucket / year
     out_dir.mkdir(parents=True, exist_ok=True)
+
     final_tar = out_dir / f"{safe_name}.tar.gz"
     temp_tar = final_tar.with_suffix(final_tar.suffix + ".part")
 
-    manifest: list[dict] = []
-
     if cfg.dry_run:
-        return f"DRY    {entry_name}: would write {final_tar}"
+        return temp_tar, final_tar, ""
 
     with tarfile.open(temp_tar, "w:gz") as tf:
         for root, _, files in os.walk(folder):
             for name in files:
-                if name == cfg.meta_name:
-                    continue
                 src_abs = Path(root) / name
                 rel = src_abs.relative_to(folder).as_posix()
                 arc_rel = f"{entry_name}/{rel}"
-                size, sha = stream_into_tar_with_sha256(tf, src_abs, arc_rel)
-                manifest.append({"path": rel, "size_bytes": size, "sha256": sha})
+                tf.add(src_abs, arcname=arc_rel, recursive=False)
 
-        manifest.sort(key=lambda x: x["path"])
-        meta_bytes = make_final_metadata(seed, manifest)
-        ti = tarfile.TarInfo(name=f"{entry_name}/{cfg.meta_name}")
-        ti.size = len(meta_bytes)
-        ti.mtime = int(datetime.now(timezone.utc).timestamp())
-        ti.mode = 0o644
-        tf.addfile(ti, fileobj=io.BytesIO(meta_bytes))
-
-    os.replace(temp_tar, final_tar)
-
-    # Calculate tar file hash
     sha256_hash = hashlib.sha256()
-    with open(final_tar, "rb") as f:
+    with open(temp_tar, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
             sha256_hash.update(chunk)
-    tar_hash = sha256_hash.hexdigest()
 
-    # Index to SharePoint if enabled
-    sharepoint_status = ""
-    if cfg.sharepoint_enabled:
-        try:
-            graph_client = GraphClient(
-                tenant_id=cfg.sharepoint_tenant_id,
-                client_id=cfg.sharepoint_client_id,
-                client_secret=cfg.sharepoint_client_secret,
-            )
-            archive_index = ArchiveIndex(
-                graph_client=graph_client,
-                site_id=cfg.sharepoint_site_id,
-                list_id=cfg.sharepoint_list_id,
-            )
-            response = archive_index.index_archive(
-                archive_name=safe_name,
-                tar_path=str(final_tar),
-                manifest_count=len(manifest),
-                tar_hash=tar_hash,
-            )
-            item_id = response.get("id")
-
-            # Upload metadata attachment
-            if item_id:
-                metadata_file = folder /cfg.meta_name
-                if metadata_file.exists():
-                    try:
-                        archive_index.upload_attachment(item_id, str(metadata_file))
-                        sharepoint_status = " [indexed +metadata attached]"
-                    except Exception as e:
-                        logger.warning(f"Failed to upload metadata attachment: {e}")
-                        sharepoint_status = " [index, attachment failed]"
-                else:
-                    sharepoint_status = " [indexed]"
-
-        except Exception as e:
-            logging.error(f"Failed to index archive to SharePoint: {e}")
-
-    # Remove the original folder
-    shutil.rmtree(folder)
-
-    return f"OK     {entry_name}: -> {final_tar} ({len(manifest)} files)"
-
-def find_ready_folders(cfg: Config) -> list[tuple[str, str]]:
-    ready = []
-    for entry in sorted(os.listdir(cfg.base_dir)):
-        # don’t eat the vault
-        if entry == cfg.archive_dir.name:
-            continue
-        folder_abs = Path(cfg.base_dir) / entry
-        if not folder_abs.is_dir():
-            continue
-        if (folder_abs / cfg.meta_name).is_file():
-            ready.append((entry, str(folder_abs)))
-    return ready
+    return temp_tar, final_tar, sha256_hash.hexdigest()
