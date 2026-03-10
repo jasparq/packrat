@@ -25,8 +25,9 @@ def _bucket_from_archive_index(archive_index: str) -> str:
 def ensure_staging_folders(
     cfg: Config,
     jobs: Sequence[PreparingJob],
-) -> tuple[list[dict[str, str]], int]:
-    created: list[dict[str, str]] = []
+) -> tuple[list[dict[str, str]], int, int]:
+    staged: list[dict[str, str]] = []
+    created = 0
     skipped = 0
 
     for job in jobs:
@@ -35,12 +36,14 @@ def ensure_staging_folders(
 
         if folder.exists():
             skipped += 1
+            staged.append({"id": job["id"], "path": str(folder)})
             continue
 
         folder.mkdir(parents=True, exist_ok=False)
-        created.append({"id": job["id"], "path": str(folder)})
+        created += 1
+        staged.append({"id": job["id"], "path": str(folder)})
 
-    return created, skipped
+    return staged, created, skipped
 
 
 def archive_folder_dataverse(

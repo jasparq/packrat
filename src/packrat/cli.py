@@ -85,10 +85,10 @@ def main() -> int:
 
         # 1) PreparingIndex -> create staging folders -> Staging
         prep_jobs = fetch_stage_ready_archive_indexes(client)
-        created, skipped = ensure_staging_folders(cfg, prep_jobs)
-        for item in created:
+        staged, created, skipped = ensure_staging_folders(cfg, prep_jobs)
+        for item in staged:
             update_job_to_staging(client, item["id"], item["path"])
-        logging.info("Dataverse staging: %d created, %d skipped", len(created), skipped)
+        logging.info("Dataverse staging: %d created, %d skipped", created, skipped)
 
         # 2) ReadyForArchive -> archive staging folder -> Archived/Failed
         ready_jobs = fetch_ready_for_archive_jobs(client)
